@@ -1,0 +1,59 @@
+长模式（x86-64）切换验证 —— 独立最小测试
+==========================================
+
+这是一个自包含的最小测试，用来在不碰内核的前提下验证：
+从 16 位实模式 → 32 位保护模式 → x86-64 长模式，全链路可行。
+
+文件
+----
+loader.asm   引导扇区，把 boot64.bin 从磁盘第 2 扇区读到 0x8000 并跳过去
+boot64.asm   自举代码：建 GDT、开保护模式、建四级页表、开长模式
+
+关键结论（已实测验证）
+----------------------
+1. 必须用 qemu-system-x86_64 启动。
+   qemu-system-i386 即使指定 -cpu qemu64 也不支持长模式：
+     CPUID 80000001 EDX = 0x0193fbfd   （LM 位 = 0）
+   而 qemu-system-x86_64：
+     CPUID 80000001 EDX = 0x2193fbfd   （LM 位 = 1）
+
+2. 进入长模式的顺序不能错：
+     建 4 级页表 → 载入 CR3 → 置 CR4.PAE(bit5)
+     → 置 EFER.LME(bit8) → 置 CR0.PG(bit31) → 远跳进 64 位代码段
+   若 EFER.LME 没设上就开 CR0.PG，会进入普通 32 位分页而不是长模式。
+
+3. 64 位代码段描述符 Flags 字节必须置 L 位（bit5）：
+     0x00AF9A000000FFFF   Access=0x9A, Flags=0xA0 → L=1, D/B=0, G=1
+
+4. 从 16 位代码里跳到 32 位段，远跳必须用 32 位形式：
+     jmp dword 0x08:pm_entry
+   否则 nasm 会编成 16 位远跳（5 字节），选择子被折进偏移，
+   跳过去用的是空选择子，直接 #GP。
+
+如何构建与运行
+--------------
+    source /tmp/tcenv.sh
+    cd boot/lm-test
+    nasm -f bin -o loader.bin loader.asm
+    nasm -f bin -o boot64.bin boot64.asm
+    cat loader.bin boot64.bin > disk.img
+    truncate -s 2M disk.img
+    qemu-system-x86_64 -drive file=disk.img,format=raw \
+        -L /tmp/tc/root/usr/share/qemu -display none \
+        -serial file:serial.log -no-reboot
+    cat serial.log
+
+预期输出
+--------
+    [boot] real mode, building page tables...
+    [boot] protected mode OK, enabling long mode...
+      CPUID 80000001 EDX = 0x2193fbfd
+      -> long mode SUPPORTED
+      EFER before = 0x00000000
+      EFER after  = 0x00000100
+    [boot] LONG MODE ACTIVE - 64-bit code running
+    [boot] x86-64 OK.
+      rax high 32 bits = 0x12345678
+
+最后一行是关键证据：往 rax 放 0x123456789ABCDEF0，取高 32 位得到
+0x12345678。若 CPU 仍在 32 位模式，这个值只能是 0。
